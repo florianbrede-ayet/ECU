@@ -34,7 +34,6 @@ long last_blinker_left;
 boolean OP_ON = false;
 boolean MAIN_ON = true;
 uint8_t set_speed = 0x0;
-double average = 0; 
 boolean blinker_left_on = true;
 boolean blinker_right_on = true;
 float LEAD_LONG_DIST = 0;
@@ -44,20 +43,56 @@ float LEAD_REL_SPEED_RAW = 0;
 boolean BRAKE_PRESSED = true;
 boolean GAS_RELEASED = false;
 
-//______________FOR SMOOTHING SPD
-const int numReadings = 160;
-float readings[numReadings];
-int readIndex = 0; 
-double total = 0;
 
-//______________FOR READING VSS SENSOR
-const byte interruptPin = 3;
-int inc = 0;
-int half_revolutions = 0;
-int spd;
-unsigned long lastmillis;
-unsigned long duration;
-uint8_t encoder = 0;
+
+const int VSS_HALL_SENSOR_INTERRUPT_PIN = 3;
+
+
+
+// VSS SENSOR
+#define VSS_SENSOR_SMOOTHING 3    // 0 = just ringbuffer*refresh rate smoothing (e.g. over 800ms). highest response rate for reliable sensors 
+                                  // 1 = in addition to 0 accounts for debounce effects of the sensor (additional, invalid signals) by limiting the change rate to 10kmh / REFRESH_RATE, e.g. 50kmh/s
+                                  // 2 = assumes the sensor might lose revolutions at higher speeds (measures the maximum speed (shortest revolution time) for each refresh rate cycle) 
+                                  // 3 = in addition to 2 accounts for debounce effects of the sensor (additional, invalid signals) by limiting the change rate to 10kmh / REFRESH_RATE, e.g. 50kmh/s
+#define VSS_MAX_SPEED 160.0f    // the maximum speed in kmh handled by the ECU in smoothing mode 1 & 2
+#define VSS_DISTANCE_PER_REVOLUTION 0.25f // 25cm driving distance per sensor revolution
+
+const int VSS_RINGBUFFER_SIZE = 4;
+const int VSS_REFRESH_RATE_MS = 200;
+float vssRingBuffer[VSS_RINGBUFFER_SIZE];
+float vssSpeedKMH=0;
+float vssSpeedSum=0;
+float vssAvgSpeedKMH=0;
+float lastValidVssSpeedKMH=0;
+
+int vssRingBufferIndex=0;
+
+unsigned long vssDuration=0;
+unsigned long lastVssRefresh=0;
+unsigned long lastValidVssSpeedTs=0;
+
+volatile byte vssSensorRevolutions=0;
+volatile unsigned long vssLastTriggerMicros=0;
+unsigned long vssLastUnhandledTriggerMicros=0;
+
+//TOYOTA CAN CHECKSUM
+int can_cksum (uint8_t *dat, uint8_t len, uint16_t addr) {
+  uint8_t checksum = 0;
+  checksum = ((addr & 0xFF00) >> 8) + (addr & 0x00FF) + len + 1;
+  //uint16_t temp_msg = msg;
+  for (int ii = 0; ii < len; ii++) {
+    checksum += (dat[ii]);
+  }
+  return checksum;
+}
+
+
+
+void interruptVssSensor() {
+  vssSensorRevolutions++;
+  vssLastTriggerMicros=micros();
+}
+
 
 
 void setup() {
@@ -68,8 +103,6 @@ CAN.begin(500E3);
 
   
 //______________initialize pins 
-pinMode(interruptPin, INPUT_PULLUP);
-attachInterrupt(digitalPinToInterrupt(interruptPin), rpm, FALLING);
 pinMode(button1, INPUT);
 pinMode(button2, INPUT);
 pinMode(button3, INPUT);
@@ -77,45 +110,94 @@ pinMode(button4, INPUT);
 pinMode(BlinkerPinLeft, INPUT_PULLUP);
 pinMode(BlinkerPinRight, INPUT_PULLUP);
 
-//______________initialize smoothing inputs
-  for (int thisReading = 0; thisReading < numReadings; thisReading++) {
-    readings[thisReading] = 0;
-  }
+  pinMode(VSS_HALL_SENSOR_INTERRUPT_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(VSS_HALL_SENSOR_INTERRUPT_PIN), interruptVssSensor, FALLING);
+
+  for (int i=0; i<VSS_RINGBUFFER_SIZE; i++)
+    vssRingBuffer[i]=0;
+
+
 }
+
+
+/**
+ * This function is called each loop and determines the current vssAvgSpeedKMH.
+ * It measures the exact micros elapsed between the last handled hall sensor trigger and the latest trigger [interrupt driven].
+ * The duration is is used to determine the highest current speed within each VSS_REFRESH_RATE_MS interval 
+ * (highest speed because at high frequencies, the hall sensor sometimes loses revolutions [capacitance?] so we use the biggest indiviual speed)
+ * The speed is averaged for VSS_RINGBUFFER_SIZE*VSS_REFRESH_RATE_MS (< 1s)
+ * */
+void loopUpdateVssSensor() {
+  #if VSS_SENSOR_SMOOTHING==0 || VSS_SENSOR_SMOOTHING==1
+    if (vssSensorRevolutions>0) {
+
+      vssDuration = (micros() - vssLastUnhandledTriggerMicros);
+      uint8_t SaveSREG = SREG;
+      noInterrupts();
+      byte tmpVssSensorRevolutions=vssSensorRevolutions;
+      vssLastUnhandledTriggerMicros=vssLastTriggerMicros;
+      vssSensorRevolutions -= tmpVssSensorRevolutions;
+      SREG = SaveSREG;
+
+      vssSpeedKMH = tmpVssSensorRevolutions * (VSS_DISTANCE_PER_REVOLUTION / (vssDuration * 0.000001)) * 3.6;
+      #if VSS_SENSOR_SMOOTHING==1
+        vssSpeedKMH=max(min(vssSpeedKMH, vssAvgSpeedKMH+10), vssAvgSpeedKMH-10);
+      #endif
+      vssTotalSensorRevolutions += tmpVssSensorRevolutions;
+    }
+    else if (micros()-vssLastUnhandledTriggerMicros>1000L*1000L) { // 1 second without hall signal is interpreted as standstill
+      vssSpeedKMH=0;
+    }
+  #elif VSS_SENSOR_SMOOTHING==2 || VSS_SENSOR_SMOOTHING==3
+    if (vssSensorRevolutions>0) {
+        vssDuration = (vssLastTriggerMicros - vssLastUnhandledTriggerMicros);
+        uint8_t SaveSREG = SREG;
+        noInterrupts();
+        byte tmpVssSensorRevolutions=vssSensorRevolutions;
+        vssLastUnhandledTriggerMicros=vssLastTriggerMicros;
+        vssSensorRevolutions -= tmpVssSensorRevolutions;
+        SREG = SaveSREG;
+
+        float tmpSpeedKMH = tmpVssSensorRevolutions * (VSS_DISTANCE_PER_REVOLUTION / (vssDuration * 0.000001)) * 3.6;
+        if (tmpSpeedKMH<=VSS_MAX_SPEED) // we cap the speed we measure to max. 150km/h (max. OP speed) because sometimes at high frequencies the hall sensor might bounce and produce incorrect, way too high readings
+          vssSpeedKMH = max(vssSpeedKMH, tmpSpeedKMH);
+        #if VSS_SENSOR_SMOOTHING==3
+          vssSpeedKMH=max(min(vssSpeedKMH, vssAvgSpeedKMH+10), vssAvgSpeedKMH-10);
+        #endif
+    }
+    else if (micros()-vssLastUnhandledTriggerMicros>1000L*1000L) { // 1 second without hall signal is interpreted as standstill
+      vssSpeedKMH=0;
+    }
+  #endif
+
+  if (millis()-lastVssRefresh>=VSS_REFRESH_RATE_MS) {
+    lastVssRefresh=millis();
+    
+    // this allows us to measure accurate low speeds (~1.5-8 km/h)
+    if (vssSpeedKMH>0) {
+      lastValidVssSpeedKMH=vssSpeedKMH;
+      lastValidVssSpeedTs=millis();
+    }
+    else if (vssSpeedKMH==0 && lastValidVssSpeedKMH>0 && millis()-lastValidVssSpeedTs<1000) {
+      vssSpeedKMH=lastValidVssSpeedKMH;
+    }
+
+    vssSpeedSum-=vssRingBuffer[vssRingBufferIndex];
+    vssSpeedSum+=vssSpeedKMH;
+    vssRingBuffer[vssRingBufferIndex]=vssSpeedKMH;
+    vssSpeedKMH=0;
+    vssRingBufferIndex++;
+    if (vssRingBufferIndex>=VSS_RINGBUFFER_SIZE)
+      vssRingBufferIndex=0;
+    vssAvgSpeedKMH = vssSpeedSum / VSS_RINGBUFFER_SIZE;
+  }
+  
+}
+
 
 void loop() {
 
-//______________READ SPD SENSOR
-attachInterrupt(1,rpm, FALLING);
-
-if (half_revolutions >= 1) {
-    detachInterrupt(1);
-    duration = (micros() - lastmillis);
-    spd = half_revolutions * (0.000135 / (duration * 0.000001)) * 3600;
-    lastmillis = micros(); 
-    half_revolutions = 0;
-    attachInterrupt(1, rpm, FALLING);
-  }
-
-//______________SMOOTH SPD TO AVERAGE
-  total = total - readings[readIndex];
-  // read from the sensor:
-  readings[readIndex] = spd;
-  // add the reading to the total:
-  total = total + readings[readIndex];
-  // advance to the next position in the array:
-  readIndex = readIndex + 1;
-
-  // if we're at the end of the array...
-  if (readIndex >= numReadings) {
-    // ...wrap around to the beginning:
-    readIndex = 0;
-  }
-
-  // calculate the average:
-  average = total / numReadings;
-  // send it to the computer as ASCII digits
-  
+  loopUpdateVssSensor();  
  
 //______________READING BUTTONS AND SWITCHES
 ClutchSwitchState = digitalRead(CluchSwitch);
@@ -172,7 +254,7 @@ if (buttonstate4 != lastbuttonstate4)
           else
           {
           OP_ON = true;
-          set_speed = (average + 3);
+          set_speed = (vssAvgSpeedKMH + 3);
           }
         }
      }
@@ -259,7 +341,7 @@ lastGAS_RELEASED = GAS_RELEASED;
 
   //0xaa msg defaults 1a 6f WHEEL_SPEEDS
   uint8_t dat_aa[8];
-  uint16_t wheelspeed = 0x1a6f + (average * 100);
+  uint16_t wheelspeed = 0x1a6f + (vssAvgSpeedKMH * 100);
   dat_aa[0] = (wheelspeed >> 8) & 0xFF;
   dat_aa[1] = (wheelspeed >> 0) & 0xFF;
   dat_aa[2] = (wheelspeed >> 8) & 0xFF;
@@ -378,8 +460,8 @@ lastGAS_RELEASED = GAS_RELEASED;
         }
   
 //______________LOGIC FOR LANE CHANGE RECOMENDITION
-  if ((average * 100) >= LCR_minimum_speed){
-  if (set_speed >= ((average * 100) + LCR_speed_diff))
+  if ((vssAvgSpeedKMH * 100) >= LCR_minimum_speed){
+  if (set_speed >= ((vssAvgSpeedKMH * 100) + LCR_speed_diff))
    {
       if (LEAD_LONG_DIST <= LCR_lead_distance)
          {    
@@ -391,23 +473,3 @@ lastGAS_RELEASED = GAS_RELEASED;
   
 } //______________END OF LOOP
 
-
-void rpm() {
-  half_revolutions++;
-  if (encoder > 255)
-  {
-    encoder = 0;
-  }
-  encoder++;
-}
-
-//TOYOTA CAN CHECKSUM
-int can_cksum (uint8_t *dat, uint8_t len, uint16_t addr) {
-  uint8_t checksum = 0;
-  checksum = ((addr & 0xFF00) >> 8) + (addr & 0x00FF) + len + 1;
-  //uint16_t temp_msg = msg;
-  for (int ii = 0; ii < len; ii++) {
-    checksum += (dat[ii]);
-  }
-  return checksum;
-}
